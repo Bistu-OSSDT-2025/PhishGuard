@@ -1,0 +1,847 @@
+// ==UserScript==
+// @name         子非鱼 - PhishGuard
+// @namespace    http://tampermonkey.net/
+// @version      3.9
+// @description  企业级钓鱼检测解决方案，支持三引擎检测与实时防护
+// @author       Manus AI
+// @match        *://*/*
+// @grant        GM_registerMenuCommand
+// @grant        GM_openInTab
+// @grant        GM_xmlhttpRequest
+// @grant        GM_addStyle
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @connect      localhost
+// @connect      127.0.0.1
+// @connect      api.deepseek.com
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    if (window.top !== window.self) return;
+
+    // ================== 全局配置 ==================
+    const CONFIG = {
+        LOCAL_MODEL_URL: 'http://localhost:5000/models/4.7.2.ubj',
+        CLOUD_API: 'http://localhost:5000/predict',
+        LOCAL_THRESHOLD: 0.68,
+        ALLOWED_KEY: 'allowed_urls_v5',
+        WHITE_LIST: GM_getValue('phishguard_white_list', ["gov.cn", "12377.cn", "baidu.com"]),
+        BLACK_LIST: GM_getValue('phishguard_black_list', ["phishing-sample.com"]),
+        MUSIC_URL: 'https://www.soundjay.com/button/sounds/button-3.mp3',
+        CACHE_TIME: 3600 * 24 * 7,
+        REQUEST_TIMEOUT: 10000,
+        DEBUG_MODE: true,
+        DEEPSEEK_API_KEY: "sk-53a951f38a694799b7f8864a4ce01623", // 使用第一个文件中的API Key
+        LANGUAGE: GM_getValue('phishguard_language', 'zh-CN') // 'zh-CN' or 'en-US'
+    };
+
+    // ================== 调试系统 ==================
+    const Logger = {
+        log(...args) { CONFIG.DEBUG_MODE && console.log('[Security]', ...args) },
+        error(...args) { console.error('[Security]', ...args) },
+        warn(...args) { console.warn('[Security]', ...args) }
+    };
+
+    // ================== UBJSON 解析器 ==================
+    const UBJSONParser = (() => {
+        const decoders = {
+            'U': data => new Uint8Array(data),
+            'i': data => new Int32Array(data),
+            'l': data => new BigInt64Array(data),
+            'f': data => new Float32Array(data),
+            'd': data => new Float64Array(data)
+        };
+
+        const readValue = (view, offset) => {
+            const type = String.fromCharCode(view.getUint8(offset++));
+            switch(type) {
+                case '{': return parseObject(view, offset);
+                case '[': return parseArray(view, offset);
+                case 'U': return parseTypedArray(view, offset, 'U');
+                case 'i': return parseTypedArray(view, offset, 'i');
+                case 'S': return parseString(view, offset);
+                default: throw new Error(`Unsupported type: ${type}`);
+            }
+        };
+
+        const parseObject = (view, offset) => {
+            const obj = {};
+            while (true) {
+                if (view.getUint8(offset) === 0x7D) {
+                    offset++;
+                    break;
+                }
+                const key = readValue(view, offset);
+                offset = key.offset;
+                const value = readValue(view, offset);
+                offset = value.offset;
+                obj[key.value] = value.value;
+            }
+            return { value: obj, offset };
+        };
+
+        const parseArray = (view, offset) => {
+            const arr = [];
+            while (true) {
+                if (view.getUint8(offset) === 0x5D) {
+                    offset++;
+                    break;
+                }
+                const element = readValue(view, offset);
+                offset = element.offset;
+                arr.push(element.value);
+            }
+            return { value: arr, offset };
+        };
+
+        const parseTypedArray = (view, offset, type) => {
+            const length = view.getUint32(offset, true);
+            offset += 4;
+            const data = new DataView(view.buffer, offset, length * getTypeSize(type));
+            offset += length * getTypeSize(type);
+            return { value: decoders[type](data), offset };
+        };
+
+        const parseString = (view, offset) => {
+            const length = view.getUint32(offset, true);
+            offset += 4;
+            const decoder = new TextDecoder();
+            const str = decoder.decode(new DataView(view.buffer, offset, length));
+            offset += length;
+            return { value: str, offset };
+        };
+
+        const getTypeSize = (type) => {
+            const sizes = { 'U': 1, 'i': 4, 'l': 8, 'f': 4, 'd': 8 };
+            return sizes[type] || 1;
+        };
+
+        return {
+            parse: buffer => readValue(new DataView(buffer), 0).value
+        };
+    })();
+
+    // ================== 模型加载系统 ==================
+    class ModelManager {
+        static CACHE_KEY = 'ai_model_v5';
+        static retries = 0;
+
+        static async load() {
+            try {
+                const cached = GM_getValue(this.CACHE_KEY);
+                if (cached && this.isValidCache(cached)) {
+                    Logger.log('使用缓存模型');
+                    return cached.data;
+                }
+                return await this.fetchModel();
+            } catch (e) {
+                if (this.retries++ < 3) {
+                    Logger.warn(`模型加载失败，尝试重试 (${this.retries}/3)`);
+                    return this.load();
+                }
+                throw new Error(`模型加载失败: ${e.message}`);
+            }
+        }
+
+        static isValidCache(cached) {
+            return Date.now() - cached.timestamp < 86400000 && // 24小时
+                   cached.data?.layers?.length === 5;
+        }
+
+        static fetchModel() {
+            return new Promise((resolve, reject) => {
+                GM_xmlhttpRequest({
+                    method: "GET",
+                    url: CONFIG.LOCAL_MODEL_URL,
+                    timeout: CONFIG.REQUEST_TIMEOUT,
+                    responseType: "arraybuffer",
+                    onload: res => {
+                        if (res.status === 200) {
+                            try {
+                                const model = UBJSONParser.parse(res.response);
+                                GM_setValue(this.CACHE_KEY, {
+                                    data: model,
+                                    timestamp: Date.now()
+                                });
+                                resolve(model);
+                            } catch (e) {
+                                reject(new Error('模型解析失败'));
+                            }
+                        } else {
+                            reject(new Error(`HTTP ${res.status}`));
+                        }
+                    },
+                    onerror: err => reject(new Error(err.details)),
+                    ontimeout: () => reject(new Error('请求超时'))
+                });
+            });
+        }
+    }
+
+    // ================== 特征工程系统 ==================
+    class FeatureExtractor {
+        static extract(url) {
+            try {
+                const parsed = new URL(url);
+                return {
+                    domainLength: parsed.hostname.length,
+                    specialCharRatio: this.calculateSpecialChars(parsed.href),
+                    tldType: this.detectTLD(parsed.hostname),
+                    pathDepth: parsed.pathname.split('/').filter(p => p).length,
+                    hasPort: !!parsed.port,
+                    isHTTPS: parsed.protocol === 'https:'
+                };
+            } catch {
+                return this.extractFromMalformed(url);
+            }
+        }
+
+        static calculateSpecialChars(str) {
+            const specials = str.match(/[^a-zA-Z0-9-.]/g) || [];
+            return specials.length / str.length;
+        }
+
+        static detectTLD(hostname) {
+            const tld = hostname.split('.').pop() || '';
+            return ['com', 'org', 'net'].includes(tld) ? 0 :
+                   ['cn', 'gov', 'edu'].includes(tld) ? 1 : 2;
+        }
+
+        static extractFromMalformed(url) {
+            return {
+                domainLength: url.length,
+                specialCharRatio: 0.5,
+                tldType: 2,
+                pathDepth: 0,
+                hasPort: false,
+                isHTTPS: false
+            };
+        }
+    }
+
+    // ================== 检测引擎核心 ==================
+    class DetectionEngine {
+        static model = null;
+
+        static async initialize() {
+            if (!this.model) {
+                this.model = await ModelManager.load();
+                Logger.log('AI引擎初始化完成');
+            }
+        }
+
+        static async analyze(url) {
+            await this.initialize();
+            const features = FeatureExtractor.extract(url);
+            return this.predict(features);
+        }
+
+        static predict(features) {
+            const normalized = this.normalizeFeatures(features);
+            let result = normalized;
+
+            this.model.layers.forEach(layer => {
+                result = this.matrixMultiply(result, layer.weights);
+                result = layer.activation === 'relu' ?
+                    result.map(x => Math.max(0, x)) :
+                    result.map(x => 1 / (1 + Math.exp(-x)));
+            });
+
+            const confidence = result[0];
+            return {
+                isPhishing: confidence > CONFIG.LOCAL_THRESHOLD,
+                confidence: Number(confidence.toFixed(2))
+            };
+        }
+
+        static normalizeFeatures(features) {
+            return [
+                features.domainLength / 100,
+                features.specialCharRatio * 10,
+                features.tldType / 2,
+                features.pathDepth / 5,
+                features.hasPort ? 1 : 0,
+                features.isHTTPS ? 0 : 1
+            ];
+        }
+
+        static matrixMultiply(a, b) {
+            return b[0].map((_, col) =>
+                b.reduce((sum, row, idx) => sum + a[idx] * row[col], 0)
+            );
+        }
+    }
+
+    // ================== 云端检测系统 ==================
+    class CloudDetector {
+        static async check(url) {
+            return new Promise((resolve, reject) => {
+                GM_xmlhttpRequest({
+                    method: "POST",
+                    url: CONFIG.CLOUD_API,
+                    data: JSON.stringify({ url, timestamp: Date.now() }),
+                    headers: { "Content-Type": "application/json" },
+                    timeout: CONFIG.REQUEST_TIMEOUT,
+                    onload: res => {
+                        try {
+                            const data = JSON.parse(res.responseText);
+                            resolve({
+                                isPhishing: data.riskScore >= 8,
+                                confidence: data.confidenceLevel
+                            });
+                        } catch {
+                            reject(new Error('无效的云端响应'));
+                        }
+                    },
+                    onerror: err => reject(err)
+                });
+            });
+        }
+    }
+
+    // ================== DeepSeek 检测系统（从第一个文件复制） ==================
+    function askDeepSeek(userMessage) {
+        const apiKey = CONFIG.DEEPSEEK_API_KEY;
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: "POST",
+                url: "https://api.deepseek.com/v1/chat/completions",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${apiKey}`
+                },
+                data: JSON.stringify({
+                    model: "deepseek-chat",
+                    messages: [{ role: "user", content: userMessage }]
+                }),
+                onload: function(response) {
+                    try {
+                        const data = JSON.parse(response.responseText);
+                        if (data.choices?.[0]?.message?.content) {
+                            const content = data.choices[0].message.content;
+                            // 分析DeepSeek的回复，判断是否为钓鱼网站
+                            const isPhishing = content.includes('是钓鱼') || content.includes('钓鱼网站') ||
+                                             content.toLowerCase().includes('phishing') ||
+                                             content.includes('危险') || content.includes('可疑') ||
+                                             content.includes('不安全') || content.includes('恶意');
+
+                            resolve({
+                                isPhishing: isPhishing,
+                                confidence: isPhishing ? 0.85 : 0.15,
+                                response: content
+                            });
+                        } else {
+                            reject(new Error('DeepSeek API 返回无效响应'));
+                        }
+                    } catch (e) {
+                        reject(new Error("解析响应时出错：" + e.message));
+                    }
+                },
+                onerror: err => reject(new Error('DeepSeek API 请求失败')),
+                ontimeout: () => reject(new Error('DeepSeek API 请求超时'))
+            });
+        });
+    }
+
+    // ================== 智能防护系统（修改为默认使用DeepSeek检测） ==================
+    class SecuritySystem {
+        static async fullCheck(url) {
+            if (this.isWhitelisted(url)) {
+                Logger.log('白名单跳过检测:', url);
+                return { isPhishing: false, confidence: 1.0 };
+            }
+            if (this.isBlacklisted(url)) {
+                Logger.log('黑名单直接判定:', url);
+                return { isPhishing: true, confidence: 1.0 };
+            }
+
+            try {
+                // 默认使用 DeepSeek 检测
+                const prompt = `这个 URL 是钓鱼网站吗？请分析：${url}`;
+                const result = await askDeepSeek(prompt);
+                return result;
+            } catch (e) {
+                Logger.error('DeepSeek检测失败，尝试云端检测:', e);
+                try {
+                    const cloudResult = await CloudDetector.check(url);
+                    return cloudResult;
+                } catch (cloudError) {
+                    Logger.error('所有检测方法失败:', cloudError);
+                    return { isPhishing: true, confidence: 0.99, response: '检测失败，建议谨慎访问' };
+                }
+            }
+        }
+
+        static isWhitelisted(url) {
+            try {
+                const hostname = new URL(url).hostname.toLowerCase();
+                const whiteList = GM_getValue('phishguard_white_list', CONFIG.WHITE_LIST);
+                return whiteList.some(domain =>
+                    hostname === domain || hostname.endsWith(`.${domain}`)
+                );
+            } catch {
+                return false;
+            }
+        }
+
+        static isBlacklisted(url) {
+            try {
+                const hostname = new URL(url).hostname.toLowerCase();
+                const blackList = GM_getValue('phishguard_black_list', CONFIG.BLACK_LIST);
+                return blackList.some(domain =>
+                    hostname === domain || hostname.endsWith(`.${domain}`)
+                );
+            } catch {
+                return false;
+            }
+        }
+    }
+
+    // ================== 辅助函数 ==================
+    const translations = {
+        'zh-CN': {
+            'app_title': '子非鱼 - PhishGuard',
+            'is_phishing_text': '该网站是：',
+            'phishing_status_yes': '是钓鱼网站',
+            'phishing_status_no': '否为钓鱼网站',
+            'confidence': '置信度：',
+            'show_details': '显示详情',
+            'settings': '设置',
+            'mode_selection': '模式选择',
+            'local_detection': '本地检测',
+            'online_detection': '联网检测',
+            'dual_mode_detection': '双模检测',
+            'trust_websites': '信任网站',
+            'single_domain_trust': '单域信任',
+            'wildcard_domain_trust': '泛域信任',
+            'deepseek_api_config': 'DeepSeek API 配置',
+            'language_settings': '语言设置',
+            'chinese_cn': '中文 CN',
+            'english_en': '英语 EN',
+            'delay_detection': '延迟检测',
+            'ms': '毫秒',
+            'local_model_not_ready': '本地模型尚未训练好。',
+            'deepseek_api_key_missing': 'DeepSeek API Key 未设置，请在设置中配置。',
+            'deepseek_response': 'DeepSeek 回复：',
+            'deepseek_parse_error': '解析 DeepSeek 响应时出错：',
+            'url_detection': 'URL 检测：',
+            'certificate_detection': '证书检测：',
+            'domain_registration_time': '域名注册时间：',
+            'add_to_whitelist_success': '已添加到白名单。',
+            'add_to_blacklist_success': '已添加到黑名单。',
+            'invalid_domain_format': '请输入有效的域名。',
+            'online_detection_failed': '联网检测失败。',
+            'whitelist_title': '白名单',
+            'blacklist_title': '黑名单',
+            'judging': '判断中...'
+        },
+        'en-US': {
+            'app_title': 'PhishGuard',
+            'is_phishing_text': 'This site is: ',
+            'phishing_status_yes': 'a phishing site',
+            'phishing_status_no': 'not a phishing site',
+            'confidence': 'Confidence: ',
+            'show_details': 'Show Details',
+            'settings': 'Settings',
+            'mode_selection': 'Mode Selection',
+            'local_detection': 'Local Detection',
+            'online_detection': 'Online Detection',
+            'dual_mode_detection': 'Dual Mode Detection',
+            'trust_websites': 'Trusted Websites',
+            'single_domain_trust': 'Single Domain Trust',
+            'wildcard_domain_trust': 'Wildcard Domain Trust',
+            'deepseek_api_config': 'DeepSeek API Configuration',
+            'language_settings': 'Language Settings',
+            'chinese_cn': 'Chinese CN',
+            'english_en': 'English EN',
+            'delay_detection': 'Delay Detection',
+            'ms': 'ms',
+            'local_model_not_ready': 'Local model is not ready yet.',
+            'deepseek_api_key_missing': 'DeepSeek API Key is not set, please configure it in settings.',
+            'deepseek_response': 'DeepSeek Response: ',
+            'deepseek_parse_error': 'Error parsing DeepSeek response: ',
+            'url_detection': 'URL Detection: ',
+            'certificate_detection': 'Certificate Detection: ',
+            'domain_registration_time': 'Domain Registration Time: ',
+            'add_to_whitelist_success': 'Added to whitelist.',
+            'add_to_blacklist_success': 'Added to blacklist.',
+            'invalid_domain_format': 'Please enter a valid domain.',
+            'online_detection_failed': 'Online detection failed.',
+            'whitelist_title': 'Whitelist',
+            'blacklist_title': 'Blacklist',
+            'judging': 'Judging...'
+        }
+    };
+
+    function getLocalizedText(key) {
+        return translations[CONFIG.LANGUAGE]?.[key] || translations['zh-CN'][key] || key;
+    }
+
+    // ================== UI 组件 ==================
+    let phishguardUI = null;
+
+    function createPhishGuardUI() {
+        if (phishguardUI) return;
+
+        phishguardUI = document.createElement('div');
+        phishguardUI.id = 'phishguard-ui';
+        phishguardUI.innerHTML = `
+            <div class="phishguard-header">
+                <span class="phishguard-title">${getLocalizedText('app_title')}</span>
+                <button class="phishguard-close" onclick="this.parentElement.parentElement.style.display='none'">×</button>
+            </div>
+            <div class="phishguard-content">
+                <div class="phishguard-result" id="phishguard-result">
+                    <div class="phishguard-status" id="phishguard-status">
+                        ${getLocalizedText('is_phishing_text')} <span id="phishguard-status-text">${getLocalizedText('judging')}</span>
+                    </div>
+                    <div class="phishguard-confidence" id="phishguard-confidence">
+                        ${getLocalizedText('confidence')} <span id="phishguard-confidence-value">--</span>
+                    </div>
+                    <button class="phishguard-details-btn" id="phishguard-details-btn">${getLocalizedText('show_details')}</button>
+                </div>
+                <div class="phishguard-controls">
+                    <div class="phishguard-section">
+                        <h4>${getLocalizedText('mode_selection')}</h4>
+                        <div class="phishguard-mode-buttons">
+                            <button class="phishguard-mode-btn active" data-mode="online">${getLocalizedText('online_detection')}</button>
+                            <button class="phishguard-mode-btn" data-mode="local">${getLocalizedText('local_detection')}</button>
+                            <button class="phishguard-mode-btn" data-mode="dual">${getLocalizedText('dual_mode_detection')}</button>
+                        </div>
+                    </div>
+                    <div class="phishguard-section">
+                        <h4>${getLocalizedText('trust_websites')}</h4>
+                        <div class="phishguard-trust-buttons">
+                            <button class="phishguard-trust-btn" id="phishguard-trust-single">${getLocalizedText('single_domain_trust')}</button>
+                            <button class="phishguard-trust-btn" id="phishguard-trust-wildcard">${getLocalizedText('wildcard_domain_trust')}</button>
+                        </div>
+                    </div>
+                    <div class="phishguard-section">
+                        <h4>${getLocalizedText('settings')}</h4>
+                        <div class="phishguard-settings">
+                            <div class="phishguard-setting-item">
+                                <label>${getLocalizedText('deepseek_api_config')}</label>
+                                <input type="password" id="phishguard-deepseek-key" placeholder="sk-..." value="${CONFIG.DEEPSEEK_API_KEY}">
+                            </div>
+                            <div class="phishguard-setting-item">
+                                <label>${getLocalizedText('language_settings')}</label>
+                                <select id="phishguard-language">
+                                    <option value="zh-CN" ${CONFIG.LANGUAGE === 'zh-CN' ? 'selected' : ''}>${getLocalizedText('chinese_cn')}</option>
+                                    <option value="en-US" ${CONFIG.LANGUAGE === 'en-US' ? 'selected' : ''}>${getLocalizedText('english_en')}</option>
+                                </select>
+                            </div>
+                            <div class="phishguard-setting-item">
+                                <label>${getLocalizedText('delay_detection')}</label>
+                                <input type="number" id="phishguard-delay" min="0" max="10000" step="100" value="1000">
+                                <span>${getLocalizedText('ms')}</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(phishguardUI);
+        initUIEventHandlers();
+
+        // 自动开始检测（默认使用 DeepSeek 联网检测）
+        setTimeout(() => {
+            performDetection('online');
+        }, 1000);
+    }
+
+    function initUIEventHandlers() {
+        // 模式切换
+        document.querySelectorAll('.phishguard-mode-btn').forEach(btn => {
+            btn.addEventListener('click', function() {
+                document.querySelectorAll('.phishguard-mode-btn').forEach(b => b.classList.remove('active'));
+                this.classList.add('active');
+                performDetection(this.dataset.mode);
+            });
+        });
+
+        // 信任网站
+        document.getElementById('phishguard-trust-single').addEventListener('click', function() {
+            const hostname = window.location.hostname;
+            const whiteList = GM_getValue('phishguard_white_list', CONFIG.WHITE_LIST);
+            if (!whiteList.includes(hostname)) {
+                whiteList.push(hostname);
+                GM_setValue('phishguard_white_list', whiteList);
+                alert(getLocalizedText('add_to_whitelist_success'));
+                updateResult(false, 1.0, '已添加到白名单');
+            }
+        });
+
+        document.getElementById('phishguard-trust-wildcard').addEventListener('click', function() {
+            const hostname = window.location.hostname;
+            const domain = hostname.split('.').slice(-2).join('.');
+            const whiteList = GM_getValue('phishguard_white_list', CONFIG.WHITE_LIST);
+            if (!whiteList.includes(domain)) {
+                whiteList.push(domain);
+                GM_setValue('phishguard_white_list', whiteList);
+                alert(getLocalizedText('add_to_whitelist_success'));
+                updateResult(false, 1.0, '已添加到白名单');
+            }
+        });
+
+        // 设置保存
+        document.getElementById('phishguard-deepseek-key').addEventListener('change', function() {
+            GM_setValue('phishguard_deepseek_api_key', this.value);
+            CONFIG.DEEPSEEK_API_KEY = this.value;
+        });
+
+        document.getElementById('phishguard-language').addEventListener('change', function() {
+            GM_setValue('phishguard_language', this.value);
+            CONFIG.LANGUAGE = this.value;
+            location.reload(); // 重新加载以应用语言更改
+        });
+
+        // 详情按钮
+        document.getElementById('phishguard-details-btn').addEventListener('click', function() {
+            const details = this.dataset.details || '暂无详细信息';
+            alert(details);
+        });
+    }
+
+    async function performDetection(mode) {
+        const statusText = document.getElementById('phishguard-status-text');
+        const confidenceValue = document.getElementById('phishguard-confidence-value');
+        const detailsBtn = document.getElementById('phishguard-details-btn');
+
+        statusText.textContent = getLocalizedText('judging');
+        confidenceValue.textContent = '--';
+
+        try {
+            let result;
+            const currentUrl = window.location.href;
+
+            switch (mode) {
+                case 'online':
+                    // 使用 DeepSeek 检测
+                    result = await SecuritySystem.fullCheck(currentUrl);
+                    break;
+                case 'local':
+                    // 使用本地检测
+                    try {
+                        result = await DetectionEngine.analyze(currentUrl);
+                    } catch (e) {
+                        result = { isPhishing: false, confidence: 0.5, response: getLocalizedText('local_model_not_ready') };
+                    }
+                    break;
+                case 'dual':
+                    // 双模检测
+                    result = await SecuritySystem.fullCheck(currentUrl);
+                    break;
+                default:
+                    result = await SecuritySystem.fullCheck(currentUrl);
+            }
+
+            updateResult(result.isPhishing, result.confidence, result.response || '检测完成');
+        } catch (error) {
+            Logger.error('检测失败:', error);
+            updateResult(true, 0.99, '检测失败: ' + error.message);
+        }
+    }
+
+    function updateResult(isPhishing, confidence, details) {
+        const statusText = document.getElementById('phishguard-status-text');
+        const confidenceValue = document.getElementById('phishguard-confidence-value');
+        const detailsBtn = document.getElementById('phishguard-details-btn');
+        const result = document.getElementById('phishguard-result');
+
+        statusText.textContent = isPhishing ? getLocalizedText('phishing_status_yes') : getLocalizedText('phishing_status_no');
+        confidenceValue.textContent = (confidence * 100).toFixed(1) + '%';
+        detailsBtn.dataset.details = details;
+
+        result.className = 'phishguard-result ' + (isPhishing ? 'phishing' : 'safe');
+    }
+
+    // ================== CSS 样式 ==================
+    GM_addStyle(`
+        #phishguard-ui {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            width: 350px;
+            background: #fff;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            z-index: 999999;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            font-size: 14px;
+        }
+
+        .phishguard-header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 12px 16px;
+            border-radius: 8px 8px 0 0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .phishguard-title {
+            font-weight: 600;
+            font-size: 16px;
+        }
+
+        .phishguard-close {
+            background: none;
+            border: none;
+            color: white;
+            font-size: 20px;
+            cursor: pointer;
+            padding: 0;
+            width: 24px;
+            height: 24px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .phishguard-content {
+            padding: 16px;
+        }
+
+        .phishguard-result {
+            background: #f8f9fa;
+            border-radius: 6px;
+            padding: 16px;
+            margin-bottom: 16px;
+            text-align: center;
+        }
+
+        .phishguard-result.safe {
+            background: #d4edda;
+            border: 1px solid #c3e6cb;
+        }
+
+        .phishguard-result.phishing {
+            background: #f8d7da;
+            border: 1px solid #f5c6cb;
+        }
+
+        .phishguard-status {
+            font-size: 16px;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+
+        .phishguard-confidence {
+            font-size: 14px;
+            margin-bottom: 12px;
+            color: #666;
+        }
+
+        .phishguard-details-btn {
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+
+        .phishguard-section {
+            margin-bottom: 16px;
+        }
+
+        .phishguard-section h4 {
+            margin: 0 0 8px 0;
+            font-size: 14px;
+            font-weight: 600;
+            color: #333;
+        }
+
+        .phishguard-mode-buttons, .phishguard-trust-buttons {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .phishguard-mode-btn, .phishguard-trust-btn {
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            flex: 1;
+            min-width: 0;
+        }
+
+        .phishguard-mode-btn.active {
+            background: #007bff;
+            color: white;
+            border-color: #007bff;
+        }
+
+        .phishguard-mode-btn:hover, .phishguard-trust-btn:hover {
+            background: #e9ecef;
+        }
+
+        .phishguard-mode-btn.active:hover {
+            background: #0056b3;
+        }
+
+        .phishguard-settings {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .phishguard-setting-item {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .phishguard-setting-item label {
+            font-size: 12px;
+            font-weight: 500;
+            color: #555;
+        }
+
+        .phishguard-setting-item input, .phishguard-setting-item select {
+            padding: 6px 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+
+        .phishguard-setting-item input[type="number"] {
+            width: 80px;
+        }
+    `);
+
+    // ================== 初始化 ==================
+    function init() {
+        // 延迟创建UI，避免与页面加载冲突
+        setTimeout(() => {
+            createPhishGuardUI();
+        }, 2000);
+
+        Logger.log('子非鱼 PhishGuard 初始化完成');
+    }
+
+    // 页面加载完成后初始化
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
+
+    // 注册菜单命令
+    GM_registerMenuCommand("打开/关闭 PhishGuard", () => {
+        if (phishguardUI) {
+            phishguardUI.style.display = phishguardUI.style.display === 'none' ? 'block' : 'none';
+        }
+    });
+
+})();
+
