@@ -1,0 +1,14 @@
+# 安装说明
+
+## 环境要求
+- 浏览器：Chrome / Edge / Firefox
+- 插件环境：Tampermonkey（油猴）
+
+## 安装步骤
+1. 安装 Tampermonkey 插件（[https://www.tampermonkey.net/](https://www.tampermonkey.net/)）。
+2. 下载本项目仓库中发行的脚本。
+3. 点击 “Raw”，然后 Tampermonkey 会自动提示安装。
+4. 安装完成后，插件即可运行。
+
+## 配置方法
+暂无复杂配置，默认安装即可使用。
