@@ -1,0 +1,10 @@
+www.google.com
+www.taobao.com
+www.facebook.com
+phishingsite.net
+fake-bank-login.com
+http://login.badsite.org
+https://secure.bank.com/account
+example.org
+test-phishing-site.com
+safe-site.org
